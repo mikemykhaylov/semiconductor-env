@@ -1,0 +1,16 @@
+[build-system]
+requires = ["flit_core >=3.2,<4"]
+build-backend = "flit_core.buildapi"
+
+[project]
+name = "semiconductor_env"
+version = "0.1.0"
+description = "A Gymnasium environment for semiconductor manufacturing"
+requires-python = ">=3.9"
+authors = [{name = "Michael Mykhaylov", email = "mikemikhailov2003@gmail.com"}]
+license = {file = "LICENSE"}
+classifiers = ["License :: OSI Approved :: MIT License"]
+dynamic = ["version", "description"]
+
+[project.urls]
+Home = "https://github.com/mikemykhaylov/semiconductor_env"
