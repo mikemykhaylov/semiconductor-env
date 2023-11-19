@@ -1,3 +1,3 @@
-black[d]==23.10.1
+black[d, jupyter]==23.10.1
 ruff==0.1.4
 isort==5.12.0
