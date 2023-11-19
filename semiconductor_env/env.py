@@ -4,13 +4,13 @@ from typing import Any
 import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
-from gymnasium.core import ObsType
+from gymnasium.core import ActType, ObsType
 
 
 class SemiconductorEnv(gym.Env):
     # Machine states
     MACHINE_OPERATIONAL = 0
-    MACHINE_BROKEN_COOLDOWN = 1
+    MACHINE_BROKEN = 1
     MACHINE_MAINTENANCE = 2
 
     # Machine parameters
@@ -28,6 +28,13 @@ class SemiconductorEnv(gym.Env):
     # Industry parameters
     PRICE_PER_CM2 = 50 / 0.01**2
     BASELINE_YIELD = 0.3
+    IDEAL_BASELINE_YIELD = 0.35
+    EQUIPMENT_YIELD_MINUS_PER_DAY = 0.001
+    FAILURE_PROB_PLUS_PER_UNMAINT_DAY = 0.001
+
+    # Maintenance parameters
+    MIN_TIME_UNTIL_MAINTENANCE = 7
+    MAX_TIME_UNTIL_MAINTENANCE = 180
 
     def __init__(self):
         machine_state = spaces.MultiBinary(3)
@@ -41,24 +48,36 @@ class SemiconductorEnv(gym.Env):
                     shape=(1,),
                     dtype=np.int64,
                 ),
-                "max_temp_delta": spaces.Box(
-                    low=0, high=1, shape=(1,), dtype=np.float64
-                ),
-                "max_displacement_delta": spaces.Box(
-                    low=0, high=1, shape=(1,), dtype=np.float64
-                ),
+                # "max_temp_delta": spaces.Box(
+                #     low=0, high=1, shape=(1,), dtype=np.float64
+                # ),
+                # "max_displacement_delta": spaces.Box(
+                #     low=0, high=1, shape=(1,), dtype=np.float64
+                # ),
             }
         )
 
         machine_previous_state = spaces.Dict(
             {
                 "days_since_last_maintenance": spaces.Box(
-                    low=0, high=np.inf, shape=(1,), dtype=np.int64
+                    low=0, high=100, shape=(1,), dtype=np.int64
                 ),
                 "days_since_last_broken": spaces.Box(
-                    low=0, high=np.inf, shape=(1,), dtype=np.int64
+                    low=0, high=100, shape=(1,), dtype=np.int64
                 ),
             }
+        )
+
+        max_price_per_chip = self.MAX_CHIP_AREA * self.PRICE_PER_CM2
+        max_late_penalty_per_day = (
+            5
+            * self._chips_per_wafer(0.001, 0.001)
+            * 0.8
+            * self.MAX_CHIP_AREA
+            * self.PRICE_PER_CM2
+        )
+        max_days_until_deadline = (
+            5 * self.MAX_ORDER_SIZE / (0.3 * self._chips_per_wafer(0.02, 0.02))
         )
 
         order_space = spaces.Dict(
@@ -67,7 +86,10 @@ class SemiconductorEnv(gym.Env):
                     low=0, high=self.MAX_ORDER_SIZE, shape=(1,), dtype=np.int64
                 ),
                 "price_per_chip": spaces.Box(
-                    low=0, high=np.inf, shape=(1,), dtype=np.float64
+                    low=0,
+                    high=max_price_per_chip,
+                    shape=(1,),
+                    dtype=np.float64,
                 ),
                 "chip_area": spaces.Box(
                     low=self.MIN_CHIP_AREA,
@@ -76,10 +98,16 @@ class SemiconductorEnv(gym.Env):
                     dtype=np.float64,
                 ),
                 "late_penalty_per_day": spaces.Box(
-                    low=0, high=np.inf, shape=(1,), dtype=np.float64
+                    low=0,
+                    high=max_late_penalty_per_day,
+                    shape=(1,),
+                    dtype=np.float64,
                 ),
                 "days_until_deadline": spaces.Box(
-                    low=0, high=np.inf, shape=(1,), dtype=np.int64
+                    low=0,
+                    high=max_days_until_deadline,
+                    shape=(1,),
+                    dtype=np.int64,
                 ),
                 "days_past_deadline": spaces.Box(
                     low=0, high=np.inf, shape=(1,), dtype=np.int64
@@ -93,12 +121,12 @@ class SemiconductorEnv(gym.Env):
             {
                 "scheduled": spaces.Discrete(2),
                 "days_until_maintenance": spaces.Box(
-                    low=0, high=np.inf, shape=(1,), dtype=np.int64
+                    low=0, high=180, shape=(1,), dtype=np.int64
                 ),
             }
         )
 
-        future_maintenance = spaces.Tuple([maintenance_space] * self.MAX_FUTURE_ORDERS)
+        # future_maintenance = spaces.Tuple([maintenance_space] * self.MAX_FUTURE_ORDERS)
 
         self.observation_space = spaces.Dict(
             {
@@ -106,41 +134,38 @@ class SemiconductorEnv(gym.Env):
                 "machine_todays_production": machine_todays_production,
                 "machine_previous_state": machine_previous_state,
                 "orders": orders,
-                "future_maintenance": future_maintenance,
+                "future_maintenance": maintenance_space,
             }
         )
 
-        self.action_space = spaces.Discrete(5)
+        self.action_space = spaces.Discrete(7)
 
         self._action_lookup = {
             0: "do_nothing",
-            1: "schedule_maintenance_in_4_weeks",
-            2: "schedule_maintenance_in_8_weeks",
-            3: "schedule_maintenance_in_12_weeks",
-            4: "schedule_maintenance_in_24_weeks",
+            1: "schedule_maintenance_in_7_days",
+            2: "schedule_maintenance_in_14_days",
+            3: "schedule_maintenance_in_30_days",
+            4: "schedule_maintenance_in_60_days",
+            5: "schedule_maintenance_in_90_days",
+            6: "deschedule_maintenance",
         }
 
     def _get_obs(self):
-        future_maintenance = []
-        for maintenance in self.state["future_maintenance"]:
-            obs_maintenance = {
-                "scheduled": maintenance["scheduled"],
-                "days_until_maintenance": np.array(
-                    [maintenance["days_until_maintenance"]]
-                ),
-            }
-            future_maintenance.append(obs_maintenance)
-        future_maintenance = tuple(future_maintenance)
-
         orders = []
         for order in self.state["orders"]:
             obs_order = {
-                "chips_left": np.array([order["chips_left"]]),
-                "price_per_chip": np.array([order["price_per_chip"]]),
-                "chip_area": np.array([order["chip_area"]]),
-                "late_penalty_per_day": np.array([order["late_penalty_per_day"]]),
-                "days_until_deadline": np.array([order["days_until_deadline"]]),
-                "days_past_deadline": np.array([order["days_past_deadline"]]),
+                "chips_left": np.array([order["chips_left"]], dtype=np.int64),
+                "price_per_chip": np.array([order["price_per_chip"]], dtype=np.float64),
+                "chip_area": np.array([order["chip_area"]], dtype=np.float64),
+                "late_penalty_per_day": np.array(
+                    [order["late_penalty_per_day"]], dtype=np.float64
+                ),
+                "days_until_deadline": np.array(
+                    [order["days_until_deadline"]], dtype=np.int64
+                ),
+                "days_past_deadline": np.array(
+                    [order["days_past_deadline"]], dtype=np.int64
+                ),
             }
             orders.append(obs_order)
 
@@ -156,14 +181,14 @@ class SemiconductorEnv(gym.Env):
                     [self.state["machine_todays_production"]["chips_produced"]],
                     dtype=np.int64,
                 ),
-                "max_temp_delta": np.array(
-                    [self.state["machine_todays_production"]["max_temp_delta"]],
-                    dtype=np.float64,
-                ),
-                "max_displacement_delta": np.array(
-                    [self.state["machine_todays_production"]["max_displacement_delta"]],
-                    dtype=np.float64,
-                ),
+                # "max_temp_delta": np.array(
+                #     [self.state["machine_todays_production"]["max_temp_delta"]],
+                #     dtype=np.float64,
+                # ),
+                # "max_displacement_delta": np.array(
+                #     [self.state["machine_todays_production"]["max_displacement_delta"]],
+                #     dtype=np.float64,
+                # ),
             },
             "machine_previous_state": {
                 "days_since_last_maintenance": np.array(
@@ -171,14 +196,22 @@ class SemiconductorEnv(gym.Env):
                         self.state["machine_previous_state"][
                             "days_since_last_maintenance"
                         ]
-                    ]
+                    ],
+                    dtype=np.int64,
                 ),
                 "days_since_last_broken": np.array(
-                    [self.state["machine_previous_state"]["days_since_last_broken"]]
+                    [self.state["machine_previous_state"]["days_since_last_broken"]],
+                    dtype=np.int64,
                 ),
             },
             "orders": orders,
-            "future_maintenance": future_maintenance,
+            "future_maintenance": {
+                "scheduled": self.state["future_maintenance"]["scheduled"],
+                "days_until_maintenance": np.array(
+                    [self.state["future_maintenance"]["days_until_maintenance"]],
+                    dtype=np.int64,
+                ),
+            },
         }
         return obs
 
@@ -299,6 +332,41 @@ class SemiconductorEnv(gym.Env):
 
         self.state["orders"].append(order)
 
+    def _update_orders(self, chips_produced):
+        # make all orders 1 day older
+        for order in self.state["orders"]:
+            order["days_past_deadline"] += 1 if order["days_until_deadline"] == 0 else 0
+            order["days_until_deadline"] = max(0, order["days_until_deadline"] - 1)
+
+        # sell chips to the first order
+        current_order = self.state["orders"][0]
+        if chips_produced > current_order["chips_left"]:
+            chips_produced = current_order["chips_left"]
+
+        current_order["chips_left"] -= chips_produced
+        profit = (
+            chips_produced * current_order["price_per_chip"]
+            - current_order["late_penalty_per_day"]
+            * current_order["days_past_deadline"]
+        )
+
+        # if the order is complete, remove it and add a new one
+        if current_order["chips_left"] == 0:
+            # if current_order["days_past_deadline"] > 0:
+            #     print(
+            #         f"Order completed {current_order['days_past_deadline']} days late"
+            #     )
+            # elif current_order["days_until_deadline"] == 0:
+            #     print("Order completed on time")
+            # else:
+            #     print(
+            #         f"Order completed {current_order['days_until_deadline']} days early"
+            #     )
+            self.state["orders"].popleft()
+            self._add_order()
+
+        return profit
+
     def reset(
         self,
         *,
@@ -306,6 +374,9 @@ class SemiconductorEnv(gym.Env):
         options: dict[str, Any] | None = None,
     ) -> tuple[ObsType, dict[str, Any]]:
         super().reset(seed=seed)
+        # set the random seed
+        if seed is not None:
+            np.random.seed(seed)
 
         self.state = {"machine_state": np.zeros(3)}
 
@@ -314,8 +385,8 @@ class SemiconductorEnv(gym.Env):
         self.state["machine_todays_production"] = {
             "yield": 1,
             "chips_produced": 0,
-            "max_temp_delta": 0,
-            "max_displacement_delta": 0,
+            # "max_temp_delta": 0,
+            # "max_displacement_delta": 0,
         }
 
         self.state["machine_previous_state"] = {
@@ -327,10 +398,109 @@ class SemiconductorEnv(gym.Env):
         for i in range(5):
             self._add_order()
 
-        self.state["future_maintenance"] = []
-        for i in range(5):
-            self.state["future_maintenance"].append(
-                {"scheduled": 0, "days_until_maintenance": 0}
-            )
+        self.state["future_maintenance"] = {"scheduled": 0, "days_until_maintenance": 0}
 
         return self._get_obs(), self._get_info()
+
+    def step(
+        self, action: ActType
+    ) -> tuple[ObsType, np.float64, bool, bool, dict[str, Any]]:
+        self.state["machine_previous_state"]["days_since_last_maintenance"] += 1
+        self.state["machine_previous_state"]["days_since_last_broken"] += 1
+
+        if self._action_lookup[action] == "schedule_maintenance_in_7_days":
+            self.state["future_maintenance"]["scheduled"] = 1
+            self.state["future_maintenance"]["days_until_maintenance"] = 7
+        elif self._action_lookup[action] == "schedule_maintenance_in_14_days":
+            self.state["future_maintenance"]["scheduled"] = 1
+            self.state["future_maintenance"]["days_until_maintenance"] = 14
+        elif self._action_lookup[action] == "schedule_maintenance_in_30_days":
+            self.state["future_maintenance"]["scheduled"] = 1
+            self.state["future_maintenance"]["days_until_maintenance"] = 30
+        elif self._action_lookup[action] == "schedule_maintenance_in_60_days":
+            self.state["future_maintenance"]["scheduled"] = 1
+            self.state["future_maintenance"]["days_until_maintenance"] = 60
+        elif self._action_lookup[action] == "schedule_maintenance_in_90_days":
+            self.state["future_maintenance"]["scheduled"] = 1
+            self.state["future_maintenance"]["days_until_maintenance"] = 90
+        elif self._action_lookup[action] == "deschedule_maintenance":
+            self.state["future_maintenance"]["scheduled"] = 0
+            self.state["future_maintenance"]["days_until_maintenance"] = 0
+
+        # remove maintenance if machine was maintained yesterday
+        if self.state["machine_state"][self.MACHINE_MAINTENANCE] == 1:
+            self.state["machine_state"][self.MACHINE_MAINTENANCE] = 0
+            self.state["machine_state"][self.MACHINE_OPERATIONAL] = 1
+            self.state["machine_previous_state"]["days_since_last_maintenance"] = 0
+
+        # advance the maintenance schedule if necessary
+        if self.state["future_maintenance"]["scheduled"] == 1:
+            self.state["future_maintenance"]["days_until_maintenance"] -= 1
+            if self.state["future_maintenance"]["days_until_maintenance"] == 0:
+                self.state["future_maintenance"]["scheduled"] = 0
+                # if the machine is currently broken, maintenance can't be performed
+                if self.state["machine_state"][self.MACHINE_BROKEN] != 1:
+                    self.state["machine_state"][self.MACHINE_OPERATIONAL] = 0
+                    self.state["machine_state"][self.MACHINE_MAINTENANCE] = 1
+                    self.state["future_maintenance"]["scheduled"] = 0
+
+        # check that machine is not in two states at once
+        if np.sum(self.state["machine_state"]) > 1:
+            print(self.state)
+            raise ValueError("Machine is in two states at once")
+
+        # process the current machine state
+        if self.state["machine_state"][self.MACHINE_OPERATIONAL] == 1:
+            # calculate probability of machine breaking based on days since last maintenance
+            # and days since last broken
+            prob_break = min(
+                1.0,
+                self.FAILURE_PROB_PLUS_PER_UNMAINT_DAY
+                * self.state["machine_previous_state"]["days_since_last_maintenance"],
+            )
+            if np.random.random() < prob_break:
+                self.state["machine_state"][self.MACHINE_OPERATIONAL] = 0
+                self.state["machine_state"][self.MACHINE_BROKEN] = 1
+                self.state["machine_previous_state"]["days_since_last_broken"] = 0
+        elif self.state["machine_state"][self.MACHINE_BROKEN] == 1:
+            if self.state["machine_previous_state"]["days_since_last_broken"] >= 3:
+                self.state["machine_state"][self.MACHINE_BROKEN] = 0
+                self.state["machine_state"][self.MACHINE_MAINTENANCE] = 1
+        elif self.state["machine_state"][self.MACHINE_MAINTENANCE] != 1:
+            raise ValueError("Invalid machine state")
+
+        current_order = self.state["orders"][0]
+
+        # if the machine is operational, produce chips
+        chip_yield = max(
+            self.IDEAL_BASELINE_YIELD
+            + 0.5 * (1 - current_order["chip_area"] / self.MAX_CHIP_AREA)
+            - self.EQUIPMENT_YIELD_MINUS_PER_DAY
+            * self.state["machine_previous_state"]["days_since_last_maintenance"],
+            self.IDEAL_BASELINE_YIELD,
+        )
+
+        # multiply by operational state to get 0 if machine is broken or in maintenance
+        chips_produced = (
+            int(chip_yield * current_order["chips_per_wafer"])
+            * self.state["machine_state"][self.MACHINE_OPERATIONAL]
+        )
+
+        profit = self._update_orders(chips_produced)
+
+        # update state
+        self.state["machine_todays_production"]["yield"] = (
+            chip_yield
+            if self.state["machine_state"][self.MACHINE_OPERATIONAL] == 1
+            else 0
+        )
+        self.state["machine_todays_production"]["chips_produced"] = chips_produced
+
+        if self.state["machine_state"][self.MACHINE_OPERATIONAL] == 1:
+            reward = profit
+        elif self.state["machine_state"][self.MACHINE_BROKEN] == 1:
+            reward = -5000
+        elif self.state["machine_state"][self.MACHINE_MAINTENANCE] == 1:
+            reward = -1000
+
+        return self._get_obs(), reward, False, False, self._get_info()
